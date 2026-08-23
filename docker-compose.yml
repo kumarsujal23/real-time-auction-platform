@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: auction
+      POSTGRES_PASSWORD: auction
+      POSTGRES_DB: auction_db
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auction"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    command: ["api"]
+    ports:
+      - "8000:8000"
+    environment:
+      ENV: development
+      DATABASE_URL: postgresql+asyncpg://auction:auction@postgres:5432/auction_db
+      SYNC_DATABASE_URL: postgresql+psycopg2://auction:auction@postgres:5432/auction_db
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: dev-secret-change-me
+      CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+      # The worker runs as its OWN service (below) in this compose file,
+      # so the API process does not also spin up an in-process copy.
+      RUN_WORKER_IN_PROCESS: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+    command: ["worker"]
+    environment:
+      ENV: development
+      DATABASE_URL: postgresql+asyncpg://auction:auction@postgres:5432/auction_db
+      SYNC_DATABASE_URL: postgresql+psycopg2://auction:auction@postgres:5432/auction_db
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: dev-secret-change-me
+      AUCTION_EXPIRY_POLL_SECONDS: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+        VITE_WS_BASE_URL: ws://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
