@@ -38,7 +38,7 @@ from app.models.auction import Auction, AuctionStatus
 from app.models.bid import Bid
 from app.models.order import Order, OrderStatus
 from app.models.user import User
-from app.services.notification_service import broadcast_auction_active, broadcast_auction_completed
+from app.services.notification_service import queue_auction_active, queue_auction_completed
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,7 @@ async def _activate_scheduled_auctions(db: AsyncSession) -> list[Auction]:
     auctions = list((await db.execute(stmt)).scalars().all())
     for auction in auctions:
         auction.status = AuctionStatus.ACTIVE
+        queue_auction_active(db, auction)
     if auctions:
         await db.commit()
         for auction in auctions:
@@ -74,9 +75,6 @@ async def _finalize_one_expired_auction(db: AsyncSession) -> Auction | None:
     if auction is None:
         return None
 
-    # Highest bid = winner. Ties on amount broken by earliest created_at
-    # (first to bid that amount wins), which is what a real auction house
-    # would do and avoids nondeterministic winner selection.
     top_bid = await db.scalar(
         select(Bid)
         .where(Bid.auction_id == auction.id)
@@ -85,7 +83,8 @@ async def _finalize_one_expired_auction(db: AsyncSession) -> Auction | None:
     )
 
     auction.status = AuctionStatus.ENDED
-
+    
+    winner_name = None
     if top_bid is not None:
         auction.winner_id = top_bid.bidder_id
         order = Order(
@@ -95,43 +94,33 @@ async def _finalize_one_expired_auction(db: AsyncSession) -> Auction | None:
             status=OrderStatus.PENDING,
         )
         db.add(order)
-    # else: no bids at all - auction simply completes with no winner/order.
+        # Fetch winner name for notification
+        winner = await db.get(User, auction.winner_id)
+        winner_name = winner.full_name if winner else None
 
     auction.status = AuctionStatus.COMPLETED
+    queue_auction_completed(
+        db,
+        auction,
+        winner_id=auction.winner_id,
+        winner_name=winner_name,
+        final_price=float(auction.current_price),
+    )
     await db.commit()
     await db.refresh(auction)
     return auction
 
 
 async def run_once() -> None:
-    """One full pass: activate anything due, finalise anything expired.
-    Split into two short transactions (rather than one long one) so a slow
-    winner-selection for one auction never delays activating others."""
+    """One full pass: activate anything due, finalise anything expired."""
     async with AsyncSessionLocal() as db:
-        activated = await _activate_scheduled_auctions(db)
-    for auction in activated:
-        await broadcast_auction_active(auction)
+        await _activate_scheduled_auctions(db)
 
-    # Drain all currently-expired auctions this tick, one transaction each,
-    # so a backlog doesn't have to wait for the next poll interval.
     while True:
         async with AsyncSessionLocal() as db:
             auction = await _finalize_one_expired_auction(db)
         if auction is None:
             break
-
-        winner_name = None
-        if auction.winner_id is not None:
-            async with AsyncSessionLocal() as db:
-                winner = await db.get(User, auction.winner_id)
-                winner_name = winner.full_name if winner else None
-
-        await broadcast_auction_completed(
-            auction,
-            winner_id=auction.winner_id,
-            winner_name=winner_name,
-            final_price=float(auction.current_price),
-        )
         logger.info(
             "Auction %s completed. winner=%s final_price=%s",
             auction.id,
@@ -142,13 +131,16 @@ async def run_once() -> None:
 
 async def run_forever(poll_seconds: float = settings.AUCTION_EXPIRY_POLL_SECONDS) -> None:
     logger.info("Auction worker started (poll interval=%.1fs)", poll_seconds)
+    
+    from app.workers.outbox_worker import process_outbox_events
+    outbox_task = asyncio.create_task(process_outbox_events())
+
     while True:
         try:
             await run_once()
         except Exception:  # noqa: BLE001 - a bad tick must never kill the loop
             logger.exception("Auction worker tick failed")
         await asyncio.sleep(poll_seconds)
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

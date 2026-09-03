@@ -9,12 +9,12 @@ from app.db.database import get_db
 from app.models.user import User
 from app.schemas.bid import BidCreate, BidOut
 from app.services import bid_service
-from app.services.notification_service import broadcast_new_bid
+
+from app.core.rate_limit import rate_limit
 
 router = APIRouter(prefix="/api/auctions", tags=["bids"])
 
-
-@router.post("/{auction_id}/bids", response_model=BidOut, status_code=status.HTTP_201_CREATED)
+@router.post("/{auction_id}/bids", response_model=BidOut, status_code=status.HTTP_201_CREATED, dependencies=[Depends(rate_limit)])
 async def place_bid(
     auction_id: uuid.UUID,
     payload: BidCreate,
@@ -41,10 +41,13 @@ async def place_bid(
             detail=f"Bid too low. Minimum required: {exc.minimum_required}",
         ) from exc
 
-    # Only broadcast for genuinely new bids - a replayed idempotent request
-    # already triggered a broadcast the first time it succeeded.
-    if not result.was_duplicate:
-        await broadcast_new_bid(result.auction, result.bid, current_user.full_name)
+    # Broadcast is now handled by the Transactional Outbox pattern asynchronously.
+    
+    # Invalidate Redis cache
+    from app.websocket.manager import get_redis
+    redis_client = get_redis()
+    await redis_client.delete(f"cache:auction:{auction_id}")
+    await redis_client.delete(f"cache:bids:{auction_id}")
 
     return BidOut(
         id=result.bid.id,

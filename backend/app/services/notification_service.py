@@ -1,64 +1,30 @@
 """
-Thin formatting layer between domain events and the WebSocket manager.
-Keeping the message *shape* defined in one place means the frontend has a
-single contract (`type` + `payload`) to rely on regardless of which code
-path triggered the event (an HTTP request handling a bid vs. the
-background worker ending an auction).
+Thin formatting layer between domain events and the Outbox table.
 """
 from __future__ import annotations
 
 import logging
 import uuid
 from decimal import Decimal
+from datetime import datetime, timezone
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auction import Auction
 from app.models.bid import Bid
-from app.websocket.manager import connection_manager
+from app.models.outbox import OutboxEvent
 
 logger = logging.getLogger(__name__)
-
 
 def _decimal_to_float(value) -> float:
     return float(value) if isinstance(value, Decimal) else value
 
+def _create_outbox_event(db: AsyncSession, auction_id: str, message: dict) -> None:
+    db.add(OutboxEvent(topic=auction_id, payload=message))
 
-async def _safe_publish(auction_id: str, message: dict) -> None:
-    """
-    Broadcasting is a best-effort side channel, never the source of truth:
-    the bid/auction state change has ALREADY been committed to Postgres by
-    the time we get here. If Redis is briefly unavailable, connected
-    clients simply miss a live update (they'll see the correct state on
-    their next REST fetch or reconnect) - but we must never let a
-    publish failure bubble up and make an already-successful, already
-    -committed request look like it failed.
-    """
-    try:
-        await connection_manager.publish(auction_id, message)
-    except Exception:  # noqa: BLE001
-        logger.warning("Failed to publish WS event for auction %s (type=%s)", auction_id, message.get("type"))
-
-
-async def broadcast_new_bid(auction: Auction, bid: Bid, bidder_name: str) -> None:
-    await _safe_publish(
-        str(auction.id),
-        {
-            "type": "bid_placed",
-            "payload": {
-                "auction_id": str(auction.id),
-                "current_price": _decimal_to_float(auction.current_price),
-                "bid": {
-                    "id": str(bid.id),
-                    "amount": _decimal_to_float(bid.amount),
-                    "bidder_name": bidder_name,
-                    "created_at": bid.created_at.isoformat() if bid.created_at else None,
-                },
-            },
-        },
-    )
-
-
-async def broadcast_auction_active(auction: Auction) -> None:
-    await _safe_publish(
+def queue_auction_active(db: AsyncSession, auction: Auction) -> None:
+    _create_outbox_event(
+        db,
         str(auction.id),
         {
             "type": "auction_active",
@@ -66,11 +32,11 @@ async def broadcast_auction_active(auction: Auction) -> None:
         },
     )
 
-
-async def broadcast_auction_completed(
-    auction: Auction, winner_id: uuid.UUID | None, winner_name: str | None, final_price: float
+def queue_auction_completed(
+    db: AsyncSession, auction: Auction, winner_id: uuid.UUID | None, winner_name: str | None, final_price: float
 ) -> None:
-    await _safe_publish(
+    _create_outbox_event(
+        db,
         str(auction.id),
         {
             "type": "auction_completed",

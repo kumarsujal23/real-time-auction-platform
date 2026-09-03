@@ -15,6 +15,7 @@ export function useAuctionSocket(auctionId: string | undefined) {
   const [connected, setConnected] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -30,10 +31,16 @@ export function useAuctionSocket(auctionId: string | undefined) {
       socket.onopen = () => {
         attempt = 0;
         if (mountedRef.current) setConnected(true);
+        pingIntervalRef.current = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send("ping");
+          }
+        }, 30000);
       };
 
       socket.onmessage = (event) => {
         if (!mountedRef.current) return;
+        if (event.data === "pong") return;
         try {
           const parsed = JSON.parse(event.data) as AuctionSocketEvent;
           setLastEvent(parsed);
@@ -45,6 +52,7 @@ export function useAuctionSocket(auctionId: string | undefined) {
       socket.onclose = () => {
         if (!mountedRef.current) return;
         setConnected(false);
+        if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
         attempt += 1;
         const backoffMs = Math.min(1000 * 2 ** attempt, 10_000);
         reconnectTimeoutRef.current = setTimeout(connect, backoffMs);
@@ -60,6 +68,7 @@ export function useAuctionSocket(auctionId: string | undefined) {
     return () => {
       mountedRef.current = false;
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
       socketRef.current?.close();
     };
   }, [auctionId]);

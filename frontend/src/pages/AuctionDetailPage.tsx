@@ -45,19 +45,31 @@ export function AuctionDetailPage() {
     if (!lastEvent || !auction) return;
 
     if (lastEvent.type === "bid_placed" && lastEvent.payload.auction_id === auction.id) {
-      const { current_price, bid } = lastEvent.payload;
-      setAuction((prev) => (prev ? { ...prev, current_price } : prev));
-      setBids((prev) => [
-        {
-          id: bid.id,
-          auction_id: auction.id,
-          bidder_id: "",
-          bidder_name: bid.bidder_name,
-          amount: bid.amount,
-          created_at: bid.created_at,
-        },
-        ...prev,
-      ]);
+      const { current_price, end_time, bid } = lastEvent.payload;
+      setAuction((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          current_price,
+          ...(end_time && { end_time }),
+        };
+      });
+      setBids((prev) => {
+        const cleanBids = prev.filter(b => !b.id.startsWith("temp-"));
+        // avoid duplicates if api request and ws event race
+        if (cleanBids.some(b => b.id === bid.id)) return cleanBids;
+        return [
+          {
+            id: bid.id,
+            auction_id: auction.id,
+            bidder_id: "",
+            bidder_name: bid.bidder_name,
+            amount: bid.amount,
+            created_at: bid.created_at,
+          },
+          ...cleanBids,
+        ];
+      });
     }
 
     if (lastEvent.type === "auction_completed" && lastEvent.payload.auction_id === auction.id) {
@@ -85,7 +97,7 @@ export function AuctionDetailPage() {
 
   const submitBid = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!id) return;
+    if (!id || !user || !auction) return;
     setBidError(null);
     const amount = Number(bidAmount);
     if (!Number.isFinite(amount) || amount < minNextBid) {
@@ -93,14 +105,30 @@ export function AuctionDetailPage() {
       return;
     }
     setPlacing(true);
+    
+    // Optimistic UI Update
+    const prevAuction = { ...auction };
+    const prevBids = [...bids];
+    setAuction({ ...auction, current_price: amount });
+    setBids([
+      {
+        id: `temp-${uuidv4()}`,
+        auction_id: auction.id,
+        bidder_id: user.id,
+        bidder_name: user.full_name + " (Pending)",
+        amount: amount,
+        created_at: new Date().toISOString(),
+      },
+      ...bids,
+    ]);
+
     try {
-      // A fresh idempotency key per submit means a client-side retry of
-      // THIS click is safe, while still letting the user place a genuinely
-      // new higher bid afterwards.
       await api.placeBid(id, amount, uuidv4());
       setBidAmount("");
     } catch (err) {
       setBidError(err instanceof ApiError ? err.message : "Failed to place bid");
+      setAuction(prevAuction);
+      setBids(prevBids);
     } finally {
       setPlacing(false);
     }
@@ -173,7 +201,7 @@ export function AuctionDetailPage() {
         <p style={{ color: "var(--muted)", fontSize: ".86rem" }}>Every bid is shown here as it happens.</p>
         {bids.length === 0 && <p style={{ color: "var(--muted)" }}>No bids yet.</p>}
         {bids.map((bid) => (
-          <div key={bid.id} className="bid-row">
+          <div key={bid.id} className="bid-row" style={{ opacity: bid.id.startsWith("temp-") ? 0.6 : 1 }}>
             <span>{bid.bidder_name ?? "Anonymous"}</span>
             <span>₹{Number(bid.amount).toLocaleString()}</span>
           </div>

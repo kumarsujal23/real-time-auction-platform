@@ -62,6 +62,10 @@ export const api = {
     return request<AuthResponse["user"]>("/api/users/me");
   },
 
+  async getServerTime() {
+    return request<{ server_time_ms: number }>("/api/auctions/time");
+  },
+
   async listAuctions(params: { status?: string; mine?: boolean } = {}) {
     const query = new URLSearchParams();
     if (params.status) query.set("status", params.status);

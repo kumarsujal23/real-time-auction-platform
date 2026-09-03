@@ -50,6 +50,7 @@ export interface BidPlacedEvent {
   payload: {
     auction_id: string;
     current_price: number;
+    end_time?: string;
     bid: {
       id: string;
       amount: number;

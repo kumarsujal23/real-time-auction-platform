@@ -10,7 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 from app.core.config import settings  # noqa: E402
 from app.db.database import Base  # noqa: E402
-from app.models import auction, bid, order, user  # noqa: E402,F401  (register models on Base.metadata)
+from app.models import auction, bid, order, outbox, user  # noqa: E402,F401  (register models on Base.metadata)
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.SYNC_DATABASE_URL)

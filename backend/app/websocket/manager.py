@@ -37,36 +37,32 @@ class ConnectionManager:
         # auction_id (str) -> set of live local sockets watching it
         self._local_connections: dict[str, set[WebSocket]] = defaultdict(set)
         self._redis: aioredis.Redis | None = None
-        self._pubsub: aioredis.client.PubSub | None = None
-        # one asyncio task per auction_id currently being listened to
-        self._listener_tasks: dict[str, asyncio.Task] = {}
+        self._pubsub_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
+        self._prefix = settings.REDIS_BID_CHANNEL_PREFIX
 
     def _channel(self, auction_id: str) -> str:
-        return f"{settings.REDIS_BID_CHANNEL_PREFIX}{auction_id}"
+        return f"{self._prefix}{auction_id}"
 
     async def connect(self) -> None:
         if self._redis is None:
             self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
+            self._pubsub_task = asyncio.create_task(self._listen_all())
 
     async def disconnect(self) -> None:
-        for task in self._listener_tasks.values():
-            task.cancel()
-        self._listener_tasks.clear()
+        if self._pubsub_task:
+            self._pubsub_task.cancel()
+            self._pubsub_task = None
         if self._redis:
             await self._redis.close()
             self._redis = None
 
     async def register(self, auction_id: str, websocket: WebSocket) -> None:
-        """Attach a socket to an auction room and ensure a Redis listener
-        exists for that room on this instance."""
+        """Attach a socket to an auction room."""
         await websocket.accept()
+        await self.connect()
         async with self._lock:
             self._local_connections[auction_id].add(websocket)
-            if auction_id not in self._listener_tasks:
-                self._listener_tasks[auction_id] = asyncio.create_task(
-                    self._listen(auction_id)
-                )
 
     async def unregister(self, auction_id: str, websocket: WebSocket) -> None:
         async with self._lock:
@@ -74,34 +70,33 @@ class ConnectionManager:
             if conns and websocket in conns:
                 conns.discard(websocket)
             if conns is not None and not conns:
-                task = self._listener_tasks.pop(auction_id, None)
-                if task:
-                    task.cancel()
                 self._local_connections.pop(auction_id, None)
 
     async def publish(self, auction_id: str, message: dict) -> None:
         """Publish an event so every backend instance (including this one)
-        broadcasts it to its local sockets. This is the ONLY way bid_service
-        / the worker should push live updates - never write to sockets
-        directly, or multi-instance deployments silently break."""
+        broadcasts it to its local sockets."""
         await self.connect()
         assert self._redis is not None
         await self._redis.publish(self._channel(auction_id), json.dumps(message, default=str))
 
-    async def _listen(self, auction_id: str) -> None:
-        await self.connect()
+    async def _listen_all(self) -> None:
+        """Single background task that listens to ALL auction channels via pattern."""
         assert self._redis is not None
         pubsub = self._redis.pubsub()
-        await pubsub.subscribe(self._channel(auction_id))
+        await pubsub.psubscribe(f"{self._prefix}*")
         try:
             async for message in pubsub.listen():
-                if message["type"] != "message":
+                if message["type"] != "pmessage":
                     continue
-                await self._broadcast_local(auction_id, message["data"])
+                channel = message["channel"]
+                # Extract auction_id from channel string (e.g. "auction:bid:1234" -> "1234")
+                if channel.startswith(self._prefix):
+                    auction_id = channel[len(self._prefix):]
+                    await self._broadcast_local(auction_id, message["data"])
         except asyncio.CancelledError:
             pass
         finally:
-            await pubsub.unsubscribe(self._channel(auction_id))
+            await pubsub.punsubscribe(f"{self._prefix}*")
             await pubsub.close()
 
     async def _broadcast_local(self, auction_id: str, raw_data: str) -> None:
@@ -114,6 +109,15 @@ class ConnectionManager:
         for ws in dead:
             await self.unregister(auction_id, ws)
 
+    @property
+    def redis(self) -> aioredis.Redis:
+        if self._redis is None:
+            raise RuntimeError("Redis not connected. Ensure connect() is called.")
+        return self._redis
+
 
 # One process-wide singleton, imported wherever a broadcast needs to happen.
 connection_manager = ConnectionManager()
+
+def get_redis() -> aioredis.Redis:
+    return connection_manager.redis

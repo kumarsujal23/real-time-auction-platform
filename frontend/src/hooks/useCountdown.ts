@@ -1,14 +1,34 @@
 import { useEffect, useState } from "react";
+import { api } from "@/services/api";
+
+let globalTimeOffset = 0;
+let hasFetchedOffset = false;
 
 export function useCountdown(targetIso: string | undefined): string {
   const [label, setLabel] = useState("--:--:--");
+  const [offset, setOffset] = useState(globalTimeOffset);
+
+  useEffect(() => {
+    if (!hasFetchedOffset) {
+      hasFetchedOffset = true;
+      api.getServerTime().then((res) => {
+        globalTimeOffset = res.server_time_ms - Date.now();
+        setOffset(globalTimeOffset);
+      }).catch(() => {
+        hasFetchedOffset = false; // Retry later if failed
+      });
+    } else {
+      setOffset(globalTimeOffset);
+    }
+  }, []);
 
   useEffect(() => {
     if (!targetIso) return;
     const target = new Date(targetIso).getTime();
 
     const tick = () => {
-      const diffMs = target - Date.now();
+      const now = Date.now() + offset;
+      const diffMs = target - now;
       if (diffMs <= 0) {
         setLabel("Ended");
         return;
@@ -24,7 +44,7 @@ export function useCountdown(targetIso: string | undefined): string {
     tick();
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [targetIso]);
+  }, [targetIso, offset]);
 
   return label;
 }

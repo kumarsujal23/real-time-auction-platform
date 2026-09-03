@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +15,12 @@ from app.services.auction_service import AuctionAuthorizationError, AuctionState
 from app.websocket.manager import connection_manager
 
 router = APIRouter(prefix="/api/auctions", tags=["auctions"])
+
+
+@router.get("/time")
+async def get_server_time() -> dict:
+    """Returns the current server time in milliseconds to calculate client clock skew."""
+    return {"server_time_ms": int(datetime.now(timezone.utc).timestamp() * 1000)}
 
 
 @router.post("", response_model=AuctionOut, status_code=status.HTTP_201_CREATED)
@@ -59,12 +66,28 @@ async def list_auctions(
     ]
 
 
+import json
+from redis.asyncio import Redis
+from app.websocket.manager import get_redis
+
 @router.get("/{auction_id}", response_model=AuctionOut)
-async def get_auction(auction_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> AuctionOut:
+async def get_auction(
+    auction_id: uuid.UUID, 
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis)
+) -> AuctionOut:
+    cache_key = f"cache:auction:{auction_id}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return AuctionOut.model_validate_json(cached)
+
     auction = await auction_service.get_auction(db, auction_id)
     if auction is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Auction not found")
-    return AuctionOut.model_validate(auction)
+        
+    out = AuctionOut.model_validate(auction)
+    await redis.setex(cache_key, 300, out.model_dump_json())
+    return out
 
 
 @router.patch("/{auction_id}", response_model=AuctionOut)
@@ -73,6 +96,7 @@ async def update_auction(
     payload: AuctionUpdate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis)
 ) -> AuctionOut:
     auction = await auction_service.get_auction(db, auction_id)
     if auction is None:
@@ -81,6 +105,7 @@ async def update_auction(
         auction = await auction_service.update_auction(
             db, auction=auction, seller_id=current_user.id, **payload.model_dump(exclude_unset=True)
         )
+        await redis.delete(f"cache:auction:{auction_id}")
     except AuctionAuthorizationError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except AuctionStateError as exc:
@@ -89,12 +114,21 @@ async def update_auction(
 
 
 @router.get("/{auction_id}/bids", response_model=list[BidOut])
-async def get_bid_history(auction_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> list[BidOut]:
+async def get_bid_history(
+    auction_id: uuid.UUID, 
+    db: AsyncSession = Depends(get_db),
+    redis: Redis = Depends(get_redis)
+) -> list[BidOut]:
+    cache_key = f"cache:bids:{auction_id}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return [BidOut(**b) for b in json.loads(cached)]
+
     auction = await auction_service.get_auction(db, auction_id)
     if auction is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Auction not found")
     bids = await auction_service.get_bid_history(db, auction_id)
-    return [
+    out = [
         BidOut(
             id=bid.id,
             auction_id=bid.auction_id,
@@ -105,6 +139,8 @@ async def get_bid_history(auction_id: uuid.UUID, db: AsyncSession = Depends(get_
         )
         for bid in bids
     ]
+    await redis.setex(cache_key, 300, json.dumps([b.model_dump(mode="json") for b in out]))
+    return out
 
 
 @router.websocket("/{auction_id}/ws")
@@ -126,7 +162,9 @@ async def auction_websocket(websocket: WebSocket, auction_id: uuid.UUID) -> None
         while True:
             # We don't expect meaningful client messages, but we must keep
             # receiving in order to detect disconnects.
-            await websocket.receive_text()
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
     except WebSocketDisconnect:
         pass
     finally:

@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -78,14 +78,7 @@ class SelfBidError(BidError):
 
 
 def _as_aware_utc(value: datetime) -> datetime:
-    """Normalizes a datetime to timezone-aware UTC.
-
-    Postgres (with TIMESTAMPTZ columns) always hands back tz-aware
-    datetimes, but SQLite - used only for fast unit tests - silently drops
-    tzinfo on round-trip. Rather than let that turn into a
-    "works in tests, breaks in prod" (or vice versa) surprise, every
-    comparison in this module goes through this normalizer first.
-    """
+    """Normalizes a datetime to timezone-aware UTC."""
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
@@ -110,9 +103,6 @@ async def place_bid(
     Places a bid atomically. Raises a `BidError` subclass for any expected
     validation failure; callers translate those to HTTP responses.
     """
-    # 1. Idempotency fast-path: if this exact (auction, key) already
-    #    produced a bid, return it instead of erroring - a retried request
-    #    should be a no-op, not a failure, from the client's perspective.
     existing = await db.scalar(
         select(Bid).where(
             Bid.auction_id == auction_id, Bid.idempotency_key == idempotency_key
@@ -123,10 +113,6 @@ async def place_bid(
         assert auction is not None
         return PlaceBidResult(bid=existing, auction=auction, was_duplicate=True)
 
-    # 2. Lock the auction row for the duration of this transaction. Any
-    #    other transaction trying to bid on this SAME auction_id will block
-    #    here until we commit/rollback, which is what makes the
-    #    check-then-act below race-free.
     auction = await db.scalar(
         select(Auction).where(Auction.id == auction_id).with_for_update()
     )
@@ -136,6 +122,7 @@ async def place_bid(
     now = datetime.now(timezone.utc)
     start_time = _as_aware_utc(auction.start_time)
     end_time = _as_aware_utc(auction.end_time)
+    
     if auction.status != AuctionStatus.ACTIVE or not (start_time <= now < end_time):
         raise AuctionNotActiveError("Auction is not currently accepting bids")
 
@@ -143,11 +130,13 @@ async def place_bid(
         raise SelfBidError("Sellers cannot bid on their own auction")
 
     minimum_required = Decimal(str(auction.current_price)) + Decimal(str(auction.min_increment))
-    # First bid on a fresh auction only has to beat the starting price
-    # itself (current_price == starting_price at that point), subsequent
-    # bids must clear the previous high bid by at least min_increment.
     if amount < minimum_required:
         raise BidTooLowError(minimum_required)
+
+    # ANTI-SNIPER AUTO-EXTENSION
+    # If the bid is placed within the last 5 minutes, extend the auction so there are 5 mins remaining.
+    if (end_time - now) < timedelta(minutes=5):
+        auction.end_time = now + timedelta(minutes=5)
 
     bid = Bid(
         auction_id=auction.id,
@@ -160,14 +149,26 @@ async def place_bid(
     auction.current_price = amount
     auction.version += 1
 
+    from app.models.outbox import OutboxEvent
+    outbox_payload = {
+        "type": "bid_placed",
+        "payload": {
+            "auction_id": str(auction.id),
+            "current_price": float(auction.current_price),
+            "end_time": auction.end_time.isoformat() if auction.end_time else None,
+            "bid": {
+                "id": str(bid.id),
+                "amount": float(bid.amount),
+                "bidder_name": bidder.full_name,
+                "created_at": now.isoformat(),
+            },
+        },
+    }
+    db.add(OutboxEvent(topic=str(auction.id), payload=outbox_payload))
+
     try:
         await db.commit()
     except IntegrityError:
-        # Backstop for the (auction_id, idempotency_key) unique constraint:
-        # a concurrent retry of the SAME request slipped past the fast-path
-        # check above and lost the race at INSERT time. Roll back our
-        # failed insert/update and hand back the row the other request
-        # created instead.
         await db.rollback()
         existing = await db.scalar(
             select(Bid).where(
